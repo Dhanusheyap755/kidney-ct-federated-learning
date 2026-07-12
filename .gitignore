@@ -182,3 +182,7 @@ cython_debug/
 data/
    *.zip
    *.pth
+   *.pt
+__pycache__/
+fl-env/
+.ipynb_checkpoints/
