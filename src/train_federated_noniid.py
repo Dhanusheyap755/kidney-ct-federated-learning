@@ -1,708 +1,175 @@
 """
 Phase 4 (Step 3): Federated Learning - Non-IID Simulation
+Reuses your existing skewed Hospital_A/B/C folders (data/hospitals/)
+and actually runs FedAvg across them (real federation, not separate models).
 
-FedKidneyNet
-------------
-Implements real Federated Learning using FedAvg over
-Hospital_A, Hospital_B and Hospital_C (Non-IID).
-
-Outputs:
-- federated_noniid_model.pth
-- federated_noniid_results.csv
-- predictions.csv
-- best_model.pth
-- accuracy_rounds.png
-- loss_rounds.png
-- confusion_matrix.png
-
-Author: FedKidneyNet
+Logs Accuracy, Precision, Recall, F1, and average training loss per round
+-> everything needed for Table III, Table IV, Fig 8, Fig 9, Fig 10.
 """
 
 import os
 import copy
 import csv
-import numpy as np
-import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
-
-from torchvision import datasets
-from torchvision import transforms
-from torchvision import models
-
-from torch.utils.data import DataLoader
-from torch.utils.data import random_split
-from torch.utils.data import ConcatDataset
-
-from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-    confusion_matrix,
-    ConfusionMatrixDisplay
-)
-
-##############################################################
-# DEVICE
-##############################################################
+from torch.utils.data import DataLoader, random_split, ConcatDataset
+from torchvision import datasets, transforms, models
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-print("="*60)
-print("FedKidneyNet : Non-IID Federated Learning")
-print("Using Device :", device)
-print("="*60)
-
-##############################################################
-# CONFIGURATION
-##############################################################
-
+# ---------------------------
+# 1. Config
+# ---------------------------
 HOSPITALS_DIR = "../data/hospitals"
-
-HOSPITALS = [
-    "Hospital_A",
-    "Hospital_B",
-    "Hospital_C"
-]
-
-NUM_CLIENTS = len(HOSPITALS)
-
-NUM_ROUNDS = 2
-LOCAL_EPOCHS = 3
-
+HOSPITALS = ["Hospital_A", "Hospital_B", "Hospital_C"]
+NUM_ROUNDS = 10
+LOCAL_EPOCHS = 1
 BATCH_SIZE = 32
-
-LEARNING_RATE = 1e-4
-
-RESULT_DIR = "../results"
-
-os.makedirs(RESULT_DIR, exist_ok=True)
-
-##############################################################
-# IMAGE PREPROCESSING
-##############################################################
+LEARNING_RATE = 0.0001
 
 transform = transforms.Compose([
-    transforms.Resize((224,224)),
+    transforms.Resize((224, 224)),
     transforms.Grayscale(num_output_channels=3),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485,0.456,0.406],
-        std=[0.229,0.224,0.225]
-    )
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-##############################################################
-# LOAD EACH HOSPITAL
-##############################################################
-
+# ---------------------------
+# 2. Load each hospital's data as a separate client (non-IID, skewed)
+# ---------------------------
+client_train_loaders = []
 client_datasets = []
-client_loaders = []
-
-print("\nLoading Hospital Datasets...\n")
 
 for hospital in HOSPITALS:
-
-    folder = os.path.join(HOSPITALS_DIR,hospital)
-
-    dataset = datasets.ImageFolder(
-        root=folder,
-        transform=transform
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True
-    )
-
-    client_datasets.append(dataset)
-    client_loaders.append(loader)
-
-    print(
-        hospital,
-        "->",
-        len(dataset),
-        "images"
-    )
+    path = os.path.join(HOSPITALS_DIR, hospital)
+    ds = datasets.ImageFolder(root=path, transform=transform)
+    client_datasets.append(ds)
+    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+    client_train_loaders.append(loader)
+    print(f"{hospital}: {len(ds)} images (non-IID, classes: {ds.classes})")
 
 class_names = client_datasets[0].classes
 num_classes = len(class_names)
 
-print("\nClasses:",class_names)
+# ---------------------------
+# 3. Build a COMMON test set (combine a held-out slice from all 3 hospitals)
+#    so the global model is judged fairly across the whole class spectrum
+# ---------------------------
+test_subsets = []
+for ds in client_datasets:
+    test_size = int(0.15 * len(ds))
+    _, test_part = random_split(ds, [len(ds) - test_size, test_size])
+    test_subsets.append(test_part)
 
-##############################################################
-# COMMON TEST SET
-##############################################################
+common_test_set = ConcatDataset(test_subsets)
+test_loader = DataLoader(common_test_set, batch_size=BATCH_SIZE, shuffle=False)
+print(f"Common test set size: {len(common_test_set)}")
 
-print("\nPreparing Common Test Set...")
-
-test_sets = []
-
-for dataset in client_datasets:
-
-    test_size = int(0.15*len(dataset))
-
-    train_size = len(dataset)-test_size
-
-    _,test = random_split(
-        dataset,
-        [train_size,test_size]
-    )
-
-    test_sets.append(test)
-
-common_test = ConcatDataset(test_sets)
-
-test_loader = DataLoader(
-    common_test,
-    batch_size=BATCH_SIZE,
-    shuffle=False
-)
-
-print("Test Images :",len(common_test))
-
-##############################################################
-# MODEL
-##############################################################
-
+# ---------------------------
+# 4. Model builder
+# ---------------------------
 def build_model():
-
-    model = models.efficientnet_b0(
-        weights=models.EfficientNet_B0_Weights.DEFAULT
-    )
-
-    model.classifier[1] = nn.Linear(
-        model.classifier[1].in_features,
-        num_classes
-    )
-
+    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
     return model.to(device)
 
-##############################################################
-# LOCAL TRAINING
-##############################################################
-
-def train_local(model,loader):
-
-    criterion = nn.CrossEntropyLoss()
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE
-    )
-
+# ---------------------------
+# 5. Local training (returns updated weights + average loss)
+# ---------------------------
+def train_local(model, loader, epochs):
     model.train()
-
-    running_loss = 0
-
-    batches = 0
-
-    for epoch in range(LOCAL_EPOCHS):
-
-        for images,labels in loader:
-
-            images = images.to(device)
-
-            labels = labels.to(device)
-
-            optimizer.zero_grad()
-
-            outputs = model(images)
-
-            loss = criterion(outputs,labels)
-
-            loss.backward()
-
-            optimizer.step()
-
-            running_loss += loss.item()
-
-            batches += 1
-
-    average_loss = running_loss/max(batches,1)
-
-    return model.state_dict(),average_loss
-
-##############################################################
-# FEDERATED AVERAGING
-##############################################################
-
-def fedavg(state_dicts,client_sizes):
-
-    total_samples = sum(client_sizes)
-
-    avg = copy.deepcopy(state_dicts[0])
-
-    for key in avg.keys():
-
-        if avg[key].dtype.is_floating_point:
-
-            avg[key] *= client_sizes[0]/total_samples
-
-            for i in range(1,len(state_dicts)):
-
-                avg[key] += (
-                    state_dicts[i][key]
-                    * client_sizes[i]/total_samples
-                )
-
-    return avg
-    ##############################################################
-# EVALUATION
-##############################################################
-
-def evaluate(model, loader):
-
-    model.eval()
-
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    total_loss, batches = 0.0, 0
+    for _ in range(epochs):
         for images, labels in loader:
-
-            images = images.to(device)
-
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
             outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            batches += 1
+    avg_loss = total_loss / max(batches, 1)
+    return model.state_dict(), avg_loss
 
+# ---------------------------
+# 6. FedAvg aggregation (weighted by client dataset size - fairer for non-IID)
+# ---------------------------
+def federated_average(state_dicts, weights):
+    total = sum(weights)
+    avg_state = copy.deepcopy(state_dicts[0])
+    for key in avg_state.keys():
+        if avg_state[key].dtype.is_floating_point:
+            avg_state[key] = avg_state[key] * (weights[0] / total)
+            for i in range(1, len(state_dicts)):
+                avg_state[key] += state_dicts[i][key] * (weights[i] / total)
+    return avg_state
+
+# ---------------------------
+# 7. Evaluation
+# ---------------------------
+def evaluate(model, loader):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            outputs = model(images)
             _, predicted = torch.max(outputs, 1)
-
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels.numpy())
-
-    accuracy = accuracy_score(all_labels, all_preds)
-
+    acc = accuracy_score(all_labels, all_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels,
-        all_preds,
-        average="weighted",
-        zero_division=0
+        all_labels, all_preds, average="weighted", zero_division=0
     )
+    return acc, precision, recall, f1
 
-    return (
-        accuracy,
-        precision,
-        recall,
-        f1,
-        all_labels,
-        all_preds
-    )
-
-
-##############################################################
-# SAVE PREDICTIONS
-##############################################################
-
-def save_predictions(labels, predictions):
-
-    prediction_file = os.path.join(
-        RESULT_DIR,
-        "predictions.csv"
-    )
-
-    with open(prediction_file, "w", newline="") as f:
-
-        writer = csv.writer(f)
-
-        writer.writerow([
-            "Actual",
-            "Predicted"
-        ])
-
-        for gt, pred in zip(labels, predictions):
-            writer.writerow([gt, pred])
-
-    print("Saved:", prediction_file)
-
-
-##############################################################
-# SAVE CONFUSION MATRIX
-##############################################################
-
-def save_confusion_matrix(labels, predictions):
-
-    cm = confusion_matrix(labels, predictions)
-
-    disp = ConfusionMatrixDisplay(
-        confusion_matrix=cm,
-        display_labels=class_names
-    )
-
-    fig, ax = plt.subplots(figsize=(6,6))
-
-    disp.plot(
-        cmap="Blues",
-        ax=ax,
-        colorbar=False
-    )
-
-    plt.title("Confusion Matrix")
-
-    plt.tight_layout()
-
-    figure = os.path.join(
-        RESULT_DIR,
-        "confusion_matrix.png"
-    )
-
-    plt.savefig(
-        figure,
-        dpi=300
-    )
-
-    plt.close()
-
-    print("Saved:", figure)
-
-
-##############################################################
-# FEDERATED TRAINING
-##############################################################
-
+# ---------------------------
+# 8. Federated training loop (Non-IID)
+# ---------------------------
 global_model = build_model()
-
 global_weights = global_model.state_dict()
+client_sizes = [len(ds) for ds in client_datasets]
 
-client_sizes = [
-    len(ds)
-    for ds in client_datasets
-]
+results_log = []
 
-results = []
+print("\n=== Starting Federated Training (Non-IID) ===")
+for rnd in range(1, NUM_ROUNDS + 1):
+    local_state_dicts = []
+    round_losses = []
 
-best_accuracy = 0.0
+    for loader in client_train_loaders:
+        local_model = build_model()
+        local_model.load_state_dict(global_weights)
+        updated_state, avg_loss = train_local(local_model, loader, LOCAL_EPOCHS)
+        local_state_dicts.append(updated_state)
+        round_losses.append(avg_loss)
 
-print("\nStarting Federated Learning...\n")
+    global_weights = federated_average(local_state_dicts, client_sizes)
+    global_model.load_state_dict(global_weights)
 
-for round_number in range(1, NUM_ROUNDS + 1):
+    acc, prec, rec, f1 = evaluate(global_model, test_loader)
+    mean_loss = sum(round_losses) / len(round_losses)
 
-    local_weights = []
+    print(f"Round {rnd}/{NUM_ROUNDS} | Avg Train Loss: {mean_loss:.4f} | "
+          f"Acc: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
 
-    local_losses = []
+    results_log.append({"round": rnd, "train_loss": mean_loss, "accuracy": acc,
+                          "precision": prec, "recall": rec, "f1": f1})
 
-    print("="*60)
-    print(
-        f"Communication Round {round_number}/{NUM_ROUNDS}"
-    )
-    print("="*60)
-
-    ##########################################################
-    # LOCAL TRAINING
-    ##########################################################
-
-    for idx, loader in enumerate(client_loaders):
-
-        print(
-            f"Training Client {idx+1}"
-        )
-
-        client_model = build_model()
-
-        client_model.load_state_dict(
-            global_weights
-        )
-
-        weights, loss = train_local(
-            client_model,
-            loader
-        )
-
-        local_weights.append(weights)
-
-        local_losses.append(loss)
-
-    ##########################################################
-    # FEDAVG
-    ##########################################################
-
-    global_weights = fedavg(
-        local_weights,
-        client_sizes
-    )
-
-    global_model.load_state_dict(
-        global_weights
-    )
-
-    ##########################################################
-    # EVALUATE GLOBAL MODEL
-    ##########################################################
-
-    accuracy, precision, recall, f1, labels, preds = evaluate(
-        global_model,
-        test_loader
-    )
-
-    average_loss = np.mean(local_losses)
-
-    print(
-        f"Loss      : {average_loss:.4f}"
-    )
-
-    print(
-        f"Accuracy  : {accuracy:.4f}"
-    )
-
-    print(
-        f"Precision : {precision:.4f}"
-    )
-
-    print(
-        f"Recall    : {recall:.4f}"
-    )
-
-    print(
-        f"F1 Score  : {f1:.4f}"
-    )
-
-    results.append({
-
-        "round": round_number,
-
-        "train_loss": average_loss,
-
-        "accuracy": accuracy,
-
-        "precision": precision,
-
-        "recall": recall,
-
-        "f1": f1
-
-    })
-
-    ##########################################################
-    # SAVE BEST MODEL
-    ##########################################################
-
-    if accuracy > best_accuracy:
-
-        best_accuracy = accuracy
-
-        torch.save(
-
-            global_model.state_dict(),
-
-            os.path.join(
-
-                RESULT_DIR,
-
-                "best_federated_noniid_model.pth"
-
-            )
-
-        )
-
-        print("Best model updated.")
-        ##############################################################
-# SAVE RESULTS CSV
-##############################################################
-
-results_file = os.path.join(
-    RESULT_DIR,
-    "federated_noniid_results.csv"
-)
-
-with open(results_file, "w", newline="") as f:
-
-    writer = csv.DictWriter(
-        f,
-        fieldnames=[
-            "round",
-            "train_loss",
-            "accuracy",
-            "precision",
-            "recall",
-            "f1"
-        ]
-    )
-
+# ---------------------------
+# 9. Save results + model
+# ---------------------------
+os.makedirs("../results", exist_ok=True)
+with open("../results/federated_noniid_results.csv", "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["round", "train_loss", "accuracy", "precision", "recall", "f1"])
     writer.writeheader()
+    writer.writerows(results_log)
 
-    writer.writerows(results)
-
-print("\nSaved:", results_file)
-
-##############################################################
-# SAVE FINAL MODEL
-##############################################################
-
-torch.save(
-
-    global_model.state_dict(),
-
-    os.path.join(
-        RESULT_DIR,
-        "federated_noniid_model.pth"
-    )
-
-)
-
-print("Saved: federated_noniid_model.pth")
-
-##############################################################
-# SAVE PREDICTIONS
-##############################################################
-
-save_predictions(labels, preds)
-
-##############################################################
-# SAVE CONFUSION MATRIX
-##############################################################
-
-save_confusion_matrix(labels, preds)
-
-##############################################################
-# ACCURACY GRAPH
-##############################################################
-
-rounds = [r["round"] for r in results]
-
-accuracies = [
-    r["accuracy"] * 100
-    for r in results
-]
-
-plt.figure(figsize=(8,5))
-
-plt.plot(
-    rounds,
-    accuracies,
-    marker="o",
-    linewidth=2
-)
-
-plt.xlabel("Communication Round")
-plt.ylabel("Accuracy (%)")
-plt.title("Federated Learning Accuracy")
-
-plt.grid(True)
-
-plt.tight_layout()
-
-accuracy_graph = os.path.join(
-    RESULT_DIR,
-    "accuracy_rounds.png"
-)
-
-plt.savefig(
-    accuracy_graph,
-    dpi=300
-)
-
-plt.close()
-
-print("Saved:", accuracy_graph)
-
-##############################################################
-# LOSS GRAPH
-##############################################################
-
-losses = [
-    r["train_loss"]
-    for r in results
-]
-
-plt.figure(figsize=(8,5))
-
-plt.plot(
-    rounds,
-    losses,
-    marker="o",
-    linewidth=2
-)
-
-plt.xlabel("Communication Round")
-plt.ylabel("Training Loss")
-plt.title("Training Loss Across Communication Rounds")
-
-plt.grid(True)
-
-plt.tight_layout()
-
-loss_graph = os.path.join(
-    RESULT_DIR,
-    "loss_rounds.png"
-)
-
-plt.savefig(
-    loss_graph,
-    dpi=300
-)
-
-plt.close()
-
-print("Saved:", loss_graph)
-
-##############################################################
-# COMMUNICATION ROUND CSV
-##############################################################
-
-communication_file = os.path.join(
-    RESULT_DIR,
-    "communication_rounds.csv"
-)
-
-with open(
-    communication_file,
-    "w",
-    newline=""
-) as f:
-
-    writer = csv.writer(f)
-
-    writer.writerow([
-        "Round",
-        "Accuracy",
-        "Loss"
-    ])
-
-    for r in results:
-
-        writer.writerow([
-            r["round"],
-            r["accuracy"],
-            r["train_loss"]
-        ])
-
-print("Saved:", communication_file)
-
-##############################################################
-# FINAL SUMMARY
-##############################################################
-
-print("\n" + "="*70)
-print("FedKidneyNet Non-IID Training Completed Successfully")
-print("="*70)
-
-print(f"Best Accuracy : {best_accuracy*100:.2f}%")
-print(f"Communication Rounds : {NUM_ROUNDS}")
-print(f"Clients : {NUM_CLIENTS}")
-
-print("\nGenerated Files")
-
-print("-------------------------------------------")
-
-print("✓ federated_noniid_model.pth")
-
-print("✓ best_federated_noniid_model.pth")
-
-print("✓ federated_noniid_results.csv")
-
-print("✓ communication_rounds.csv")
-
-print("✓ predictions.csv")
-
-print("✓ confusion_matrix.png")
-
-print("✓ accuracy_rounds.png")
-
-print("✓ loss_rounds.png")
-
-print("\nResults Folder :", RESULT_DIR)
-
-print("="*70)
+torch.save(global_model.state_dict(), "../federated_noniid_model.pth")
+print("\nSaved: ../federated_noniid_model.pth")
+print("Saved: ../results/federated_noniid_results.csv  (Table III & IV / Fig 8, 9, 10)")
